@@ -2,14 +2,16 @@ package slick.driver
 
 import java.util.UUID
 import java.sql.{PreparedStatement, ResultSet}
+import slick.util.ConstArray
+
 import scala.concurrent.ExecutionContext
 import slick.dbio._
 import slick.lifted._
 import slick.profile.{SqlProfile, RelationalProfile, Capability}
-import slick.ast.{SequenceNode, Library, FieldSymbol, Node, Insert, InsertColumn, Select, ElementSymbol, ColumnOption }
+import slick.ast._
 import slick.ast.Util._
 import slick.util.MacroSupport.macroSupportInterpolation
-import slick.compiler.CompilerState
+import slick.compiler.{Phase, CompilerState}
 import slick.jdbc.meta.{MIndexInfo, MColumn, MTable}
 import slick.jdbc.{JdbcModelBuilder, JdbcType}
 import slick.model.Model
@@ -53,7 +55,7 @@ trait MyPostgresDriver extends JdbcDriver { driver =>
     - JdbcProfile.capabilities.insertOrUpdate
     - JdbcProfile.capabilities.nullableNoDefault
     - JdbcProfile.capabilities.supportsByte
-    )
+  )
 
   class ModelBuilder(mTables: Seq[MTable], ignoreInvalidDefaults: Boolean)(implicit ec: ExecutionContext) extends JdbcModelBuilder(mTables, ignoreInvalidDefaults) {
     override def createTableNamer(mTable: MTable): TableNamer = new TableNamer(mTable) {
@@ -105,6 +107,7 @@ trait MyPostgresDriver extends JdbcDriver { driver =>
     MTable.getTables(None, None, None, Some(Seq("TABLE")))
 
   override val columnTypes = new JdbcTypes
+  override protected def computeQueryCompiler = super.computeQueryCompiler - Phase.rewriteDistinct
   override def createQueryBuilder(n: Node, state: CompilerState): QueryBuilder = new QueryBuilder(n, state)
   override def createUpsertBuilder(node: Insert): InsertBuilder = new UpsertBuilder(node)
   override def createTableDDLBuilder(table: Table[_]): TableDDLBuilder = new TableDDLBuilder(table)
@@ -113,19 +116,35 @@ trait MyPostgresDriver extends JdbcDriver { driver =>
   override protected lazy val useTransactionForUpsert = true
   override protected lazy val useServerSideUpsertReturning = false
 
-  override def defaultSqlTypeName(tmd: JdbcType[_], size: Option[RelationalProfile.ColumnOption.Length]): String = tmd.sqlType match {
+  override def defaultSqlTypeName(tmd: JdbcType[_], sym: Option[FieldSymbol]): String = tmd.sqlType match {
     case java.sql.Types.VARCHAR =>
+      val size = sym.flatMap(_.findColumnOption[RelationalProfile.ColumnOption.Length])
       size.fold("VARCHAR")(l => if(l.varying) s"VARCHAR(${l.length})" else s"CHAR(${l.length})")
     case java.sql.Types.BLOB => "lo"
     case java.sql.Types.DOUBLE => "DOUBLE PRECISION"
     /* PostgreSQL does not have a TINYINT type, so we use SMALLINT instead. */
     case java.sql.Types.TINYINT => "SMALLINT"
-    case _ => super.defaultSqlTypeName(tmd, size)
+    case _ => super.defaultSqlTypeName(tmd, sym)
   }
 
   class QueryBuilder(tree: Node, state: CompilerState) extends super.QueryBuilder(tree, state) {
     override protected val concatOperator = Some("||")
-    override protected val supportsEmptyJoinConditions = false
+    override protected val quotedJdbcFns = Some(Vector(Library.Database, Library.User))
+
+    override protected def buildSelectModifiers(c: Comprehension): Unit = (c.distinct, c.select) match {
+      case (Some(ProductNode(onNodes)), Pure(ProductNode(selNodes), _)) if onNodes.nonEmpty =>
+        def eligible(a: ConstArray[Node]) = a.forall {
+          case _: PathElement => true
+          case _: LiteralNode => true
+          case _: QueryParameter => true
+          case _ => false
+        }
+        if(eligible(onNodes) && eligible(selNodes) &&
+          onNodes.iterator.collect[List[TermSymbol]] { case FwdPath(ss) => ss }.toSet ==
+            selNodes.iterator.collect[List[TermSymbol]] { case FwdPath(ss) => ss }.toSet
+        ) b"distinct " else super.buildSelectModifiers(c)
+      case _ => super.buildSelectModifiers(c)
+    }
 
     override protected def buildFetchOffsetClause(fetch: Option[Node], offset: Option[Node]) = (fetch, offset) match {
       case (Some(t), Some(d)) => b"\nlimit $t offset $d"
@@ -135,8 +154,13 @@ trait MyPostgresDriver extends JdbcDriver { driver =>
     }
 
     override def expr(n: Node, skipParens: Boolean = false) = n match {
+      case Library.UCase(ch) => b"upper($ch)"
+      case Library.LCase(ch) => b"lower($ch)"
+      case Library.IfNull(ch, d) => b"coalesce($ch, $d)"
       case Library.NextValue(SequenceNode(name)) => b"nextval('$name')"
       case Library.CurrentValue(SequenceNode(name)) => b"currval('$name')"
+      case Library.CurrentDate() => b"current_date"
+      case Library.CurrentTime() => b"current_time"
       case _ => super.expr(n, skipParens)
     }
   }
@@ -148,10 +172,10 @@ trait MyPostgresDriver extends JdbcDriver { driver =>
       val nonAutoIncVars = nonAutoIncSyms.map(_ => "?").mkString(",")
       val cond = pkNames.map(n => s"$n=?").mkString(" and ")
       val insert = s"insert into $tableName ($nonAutoIncNames) select $nonAutoIncVars where not exists (select 1 from $tableName where $cond)"
-      new InsertBuilderResult(table, s"begin; $update; $insert; end", softSyms ++ pkSyms)
+      new InsertBuilderResult(table, s"begin; $update; $insert; end", ConstArray.from(softSyms ++ pkSyms))
     }
 
-    override def transformMapping(n: Node) = reorderColumns(n, softSyms ++ pkSyms ++ nonAutoIncSyms ++ pkSyms)
+    override def transformMapping(n: Node) = reorderColumns(n, softSyms ++ pkSyms ++ nonAutoIncSyms.toSeq ++ pkSyms)
   }
 
   class TableDDLBuilder(table: Table[_]) extends super.TableDDLBuilder(table) {
@@ -198,11 +222,11 @@ trait MyPostgresDriver extends JdbcDriver { driver =>
 
     class ByteArrayJdbcType extends super.ByteArrayJdbcType {
       override val sqlType = java.sql.Types.BINARY
-      override def sqlTypeName(size: Option[RelationalProfile.ColumnOption.Length]) = "BYTEA"
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "BYTEA"
     }
 
     class UUIDJdbcType extends super.UUIDJdbcType {
-      override def sqlTypeName(size: Option[RelationalProfile.ColumnOption.Length]) = "UUID"
+      override def sqlTypeName(sym: Option[FieldSymbol]) = "UUID"
       override def setValue(v: UUID, p: PreparedStatement, idx: Int) = p.setObject(idx, v, sqlType)
       override def getValue(r: ResultSet, idx: Int) = r.getObject(idx).asInstanceOf[UUID]
       override def updateValue(v: UUID, r: ResultSet, idx: Int) = r.updateObject(idx, v)
